@@ -1,0 +1,258 @@
+#include <Arduino.h>
+#include <Adafruit_BNO055.h>
+#include <Wire.h>// Para la comunicacion I2C
+#include <SPI.h>
+#include <utility/imumaths.h>
+#include <math.h>
+#include <WiFi.h>
+#include <ModbusIP_ESP8266.h>
+
+
+#define BNO055_SAMPLERATE 1 //lee el valor del sensor cada 1 ms
+Adafruit_BNO055 myVal= Adafruit_BNO055();
+
+//const char* ssid= "TP-LINK_7794";
+//const char* password= "00280549";
+const char* ssid= "TP-LINK_7794";
+const char* password= "00280549";
+
+ModbusIP mb;//Objeto de la librería
+const int func_mode=0;// Registro 0, de tipo coil
+const int sensor_value=0;// REgistro 0 de tipo Ireg
+const int kp_value=0;// Registro 0 de tipo Hreg
+const int kp_factor=1;// Registro 1 de tipo Hreg
+const int ki_value=2;// Registro 2 de tipo Hreg
+const int ki_factor=3;// Registro 3 de tipo Hreg
+const int kd_value=4;// Registro 4 de tipo Hreg
+const int kd_factor=5;// Registro 5 de tipo Hreg
+boolean on_off=0;
+
+//declaramos una nueva tarea para poder usar los dos cores de forma paralela
+// RTOS (sistema operativo en tiempo real)
+TaskHandle_t Task0;//Declaramos una nueva tarea
+void loop2(void *parameter );// Funcion que se ejecuta en la Task0
+
+
+const int pin_vel=5;
+const int pin_dir=19;
+
+boolean direc=0;
+//Parametros que afectan al PID
+const double refe=0.00;
+double kp=36.00;
+double ki=0.0;
+double kd=0.00;
+int duty_cycle;
+
+// Varaiables de configuracion del motor
+const int freq=20000;// frec de  de prueba del pulso PWM
+const int pwmChannel=0;// esto es asi usamos el timer 0 del esp32 para esta funcion
+const int resolution=8; // Pq el L298 tiene una resolucion de 8 bits
+
+const double pasar_a_seg=1000000.0; //si cambiamos la variable de escala_timer, deberremos cambiar esta para calcular dt en unidades del sistema internacional
+
+void change_register(float value);
+void setup_modbus();
+void update_PID(double sens_value);
+void reconnectWiFi();
+
+void setup() {
+  // put your setup code here, to run once:
+  Wire.begin();
+  Serial.begin(115200);
+
+  if (!myVal.begin())//Aviso en el caso de que el sensor no se inicie correctamente
+  {
+    Serial.println("No se pudo inicializar el sensor BNO055. Por favor, revise la conexión.");
+    while (1);
+  }
+  // Calibrar el sensor
+  Serial.println("Iniciando calibración. Por favor, coloque el sensor en una posición fija...");
+  myVal.setExtCrystalUse(true); // Usar cristal externo para una mayor precisión
+  
+  pinMode(pin_vel,OUTPUT);
+  pinMode(pin_dir,OUTPUT);
+  
+  // Configuracion del canal PWM
+  ledcSetup(pwmChannel,freq,resolution);
+  // asignamos la configuracion del canal pwm a un pin en especifico
+  ledcAttachPin(pin_vel,pwmChannel);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Conectando a:\t");
+  Serial.println(ssid); 
+  
+  // Esperar a que nos conectemos
+  while (WiFi.status() != WL_CONNECTED) 
+  {
+    delay(200);
+  Serial.print('.');
+  }
+
+  // Mostrar mensaje de exito y dirección IP asignada
+  Serial.println();
+  Serial.print("Conectado a:\t");
+  Serial.println(WiFi.SSID()); 
+  Serial.print("IP address:\t");
+  Serial.println(WiFi.localIP());
+
+  //AJUSTAR EL TAMAÑO DE LA PILA
+  // Creamos la tarea que apunte a un nucleo en particular
+  xTaskCreatePinnedToCore(
+    loop2,/*Función que  se ejecuta en la tarea*/
+    "Task_0",/*Nombre de la tarea*/
+    4096,/*Tamaño de la pila de la tarea*/
+    NULL,
+    1,/*Prioridad de la tarea, siendo 0 la menor*/
+    &Task0,
+    0/*Asignamos la tarea al núcleo 0*/
+  );
+  setup_modbus();
+  
+}
+
+void loop() {
+  
+  Serial.print("Control ejecutandose en el core: ");
+  Serial.println(String(xPortGetCoreID()));
+  for( ;; ){
+    if(on_off==1){//Esto es como si lo comparamos con true
+    imu::Vector<3> euler = myVal.getVector(Adafruit_BNO055::VECTOR_EULER);
+    change_register(euler.y());//LLamamos a la funcion que modifica el registro del sensor
+    update_PID(euler.y());
+  }else{//Paramos el motor
+    ledcWrite(pwmChannel,0);
+  }
+  
+  vTaskDelay(pdMS_TO_TICKS(1));
+  }
+   
+  
+}
+
+void loop2(void *parameter){
+  Serial.print("Modbus ejecutandose en el core: ");
+  Serial.println(String(xPortGetCoreID()));
+
+  static int kp_changed=0;
+  static int ki_changed=0;
+  static int kd_changed=0;
+  static int kp_changed_current=0;
+  static int ki_changed_current=0;
+  static int kd_changed_current=0;
+  boolean on_off_2=false;
+
+  for( ;; ){
+    //UBaseType_t water_mark=uxTaskGetStackHighWaterMark(NULL);
+    //Serial.println(water_mark);
+    if (WiFi.status() != WL_CONNECTED) {
+      reconnectWiFi();
+    }
+
+    mb.task();//Procesa las solicitudes de lectura y escritura
+
+    on_off_2=mb.Coil(func_mode);//Leemos el registro de tipo coil
+    if(on_off_2!=on_off){// En el caso de que sean distintos, cambiamos el modo de funcionamiento
+      on_off=on_off_2;
+      Serial.print("On_off");
+      Serial.println(on_off);
+    }
+    if(!on_off){//Actualizamos las ctes unicamente cuando estemos en modo stop
+      kp_changed_current=mb.Hreg(kp_value);//Leemos el valor del regsitro, almacena el número sin decimales
+      ki_changed_current=mb.Hreg(ki_value);
+      kd_changed_current=mb.Hreg(kd_value); 
+      //Actualizacion delkp
+      if(kp_changed_current!=kp_changed){// Si es distinto calculamos el nuevo valor
+        kp = double(kp_changed_current) / double(mb.Hreg(kp_factor));//Debemos de convertir los valores de los regsitros a "double" porque la kp es de tipo double
+        //Dividimos el número sin decimales entre el factor para obtener el número original con decimales
+        kp_changed=kp_changed_current;
+        Serial.print("Kp=");
+        Serial.println(kp);
+      }// Actualizacion de la Ki
+      if(ki_changed_current!=ki_changed){ // Si es distinto calculamos el nuevo valor
+        ki = double(ki_changed_current) / double(mb.Hreg(ki_factor));//Debemos de convertir los valores de los regsitros a "double" porque la ki es de tipo double
+        ki_changed=ki_changed_current;
+        Serial.print("Ki=");
+        Serial.println(ki);
+      }//Actualizacion de la kd
+      if(kd_changed_current!=kd_changed){ // Si es distinto calculamos el nuevo valor
+        kd = double(kd_changed_current) / double(mb.Hreg(kd_factor));//Debemos de convertir los valores de los regsitros a "double" porque la kd es de tipo double
+        kd_changed=kd_changed_current;
+        Serial.print("Kd=");
+        Serial.println(kd);
+      }
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(1));//pasusa 1 ms en ticks del reloj
+  } 
+  
+  
+}
+
+void change_register(float value){//Multiplicamos el angulo por 100 y en funcion de un registro auxiliar sabemos si es positivo o negativo
+  uint16_t value_aux=value*100;//Multiplicamos el angulo por 100, para quitar decimales, pero el signo se conserva
+  mb.Ireg(sensor_value,value_aux);
+}
+
+void setup_modbus(){
+  mb.server();//Usamos el esp32 como servidor
+  mb.addCoil(func_mode);//Creamos el registro 0 de tipo Coil
+  mb.Coil(func_mode,0);// Ponemos a 0 el registro 0 de tipo COil
+  mb.addIreg(sensor_value);//Creamos el registro 0 de tipo Input Regsiter
+  mb.addHreg(kp_value);//Creamos el registro 0 de tipo Holding Register
+  mb.addHreg(kp_factor);//Creamos el registro 1 de tipo Holding Register
+  mb.addHreg(ki_value);//Creamos el registro 2 de tipo Holding Register
+  mb.addHreg(ki_factor);//Creamos el registro 3 de tipo Holding Register
+  mb.addHreg(kd_value); //Creamos el registro 4 de tipo Holding Register
+  mb.addHreg(kd_factor);//Creamos el registro 5 de tipo Holding Register
+}
+void update_PID(double sens_value){
+  //Definimos las variables locales y le ponemos static para no perder el valor 
+  static double error=0.0;
+  static double error_old=0.0;
+  static double proporcional=0.0;
+  static double integral=0.0;
+  static double derivativo=0.0;
+  static double dt_PID;
+  static unsigned long temp_old_PID=0;
+  static unsigned long temp_new_PID=0;
+  static boolean direc=0;
+  
+  temp_new_PID=micros();
+  
+  dt_PID=(temp_new_PID-temp_old_PID)/pasar_a_seg;    
+  error=refe-sens_value;
+  //PID, la accion integral y derivativa por el tiempo por el tiempo transcurrido entre que se ejecuta y la ejecucion anterior
+  proporcional=kp*error;
+  integral +=ki*error*dt_PID;
+  //Limitamos la acción integral, entre los valores maimos con signo de la señal pwm, para que no crezca infinito. El signo indica la dirección;
+  integral = constrain(integral, -255, 255);
+
+  derivativo=kd*(error-error_old)/dt_PID;
+    
+  duty_cycle=proporcional+integral+derivativo;
+    
+  error_old=error;
+    
+  temp_old_PID=temp_new_PID;
+  direc = (duty_cycle >= 0) ? 0 : 1;//Ajustar esto en caso de error
+  duty_cycle = constrain(abs(duty_cycle), 0, 255);//Constrain, limita el valor entre 0 y 255
+   
+  digitalWrite(pin_dir,direc);
+  ledcWrite(pwmChannel,duty_cycle);
+  
+}
+
+void reconnectWiFi(){
+  Serial.println("Perdida de conexión, intentando reconectar...");
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+      vTaskDelay(pdMS_TO_TICKS(200));
+      // Tambien podemos usar: delay(pdMS_TO_TICKS(200));
+      Serial.print(".");
+    }
+    Serial.println();
+    Serial.println("Conexión establecida");
+}
+
+
